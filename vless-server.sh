@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.1.9 [服务端]
+#  多协议代理一键部署脚本 v3.1.10 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -550,17 +550,17 @@ generate_xray_config() {
     
     mkdir -p "$CFG"
     
-    # 读取直连出口 IP 版本设置
-    local direct_ip_version="auto"
+    # 读取直连出口 IP 版本设置（默认优先 IPv6）
+    local direct_ip_version="prefer_ipv6"
     [[ -f "$CFG/direct_ip_version" ]] && direct_ip_version=$(cat "$CFG/direct_ip_version")
     
     # 根据设置生成 freedom 出口配置
     local direct_outbound='{"protocol": "freedom", "tag": "direct"}'
     case "$direct_ip_version" in
-        ipv4)
+        ipv4|ipv4_only)
             direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4"}}'
             ;;
-        ipv6)
+        ipv6|ipv6_only)
             direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv6"}}'
             ;;
         prefer_ipv4)
@@ -581,63 +581,83 @@ generate_xray_config() {
     
     if [[ -n "$rules" && "$rules" != "[]" ]]; then
         # 收集所有用到的出口 (支持多出口)
-        local added_warp=false
-        local added_warp_ipv6=false
-        declare -A added_chains  # 记录已添加的链式代理节点
-        declare -A added_chains_ipv6  # 记录已添加的 IPv6 链式代理节点
         
         while IFS= read -r rule_json; do
             [[ -z "$rule_json" ]] && continue
             local outbound=$(echo "$rule_json" | jq -r '.outbound')
-            local ipv6_only=$(echo "$rule_json" | jq -r '.ipv6_only // false')
+            local ip_version=$(echo "$rule_json" | jq -r '.ip_version // "prefer_ipv4"')
             
             if [[ "$outbound" == "direct" ]]; then
-                # 直连规则：如果需要 IPv6 only，添加专用的 direct-ipv6 出口
-                if [[ "$ipv6_only" == "true" ]]; then
-                    # 检查是否已添加 direct-ipv6 出口
-                    if ! echo "$outbounds" | jq -e '.[] | select(.tag == "direct-ipv6")' >/dev/null 2>&1; then
-                        local direct_ipv6_out='{"protocol": "freedom", "tag": "direct-ipv6", "settings": {"domainStrategy": "UseIPv6"}}'
-                        outbounds=$(echo "$outbounds" | jq --argjson out "$direct_ipv6_out" '. + [$out]')
-                    fi
-                fi
+                # 直连规则：根据 IP 版本策略添加专用出口
+                case "$ip_version" in
+                    ipv4_only)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-ipv4" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_ipv4_out='{"protocol": "freedom", "tag": "direct-ipv4", "settings": {"domainStrategy": "UseIPv4"}}'
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_ipv4_out" '. + [$out]')
+                        fi
+                        ;;
+                    ipv6_only)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-ipv6" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_ipv6_out='{"protocol": "freedom", "tag": "direct-ipv6", "settings": {"domainStrategy": "UseIPv6"}}'
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_ipv6_out" '. + [$out]')
+                        fi
+                        ;;
+                    prefer_ipv6)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv6" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_prefer_ipv6_out='{"protocol": "freedom", "tag": "direct-prefer-ipv6", "settings": {"domainStrategy": "PreferIPv6"}}'
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv6_out" '. + [$out]')
+                        fi
+                        ;;
+                    prefer_ipv4|*)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv4" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_prefer_ipv4_out='{"protocol": "freedom", "tag": "direct-prefer-ipv4", "settings": {"domainStrategy": "PreferIPv4"}}'
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv4_out" '. + [$out]')
+                        fi
+                        ;;
+                esac
             elif [[ "$outbound" == "warp" ]]; then
-                if [[ "$ipv6_only" == "true" && "$added_warp_ipv6" == "false" ]]; then
-                    # 生成 WARP IPv6 专用出口
+                local warp_tag=""
+                local warp_strategy=""
+                case "$ip_version" in
+                    ipv4_only)
+                        warp_tag="warp-ipv4"
+                        warp_strategy="UseIPv4"
+                        ;;
+                    ipv6_only)
+                        warp_tag="warp-ipv6"
+                        warp_strategy="UseIPv6"
+                        ;;
+                    prefer_ipv6)
+                        warp_tag="warp-prefer-ipv6"
+                        warp_strategy="PreferIPv6"
+                        ;;
+                    prefer_ipv4|*)
+                        warp_tag="warp-prefer-ipv4"
+                        warp_strategy="PreferIPv4"
+                        ;;
+                esac
+                if ! echo "$outbounds" | jq -e --arg tag "$warp_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                     local warp_out=$(gen_xray_warp_outbound)
                     if [[ -n "$warp_out" ]]; then
-                        local warp_ipv6_out=$(echo "$warp_out" | jq '.tag = "warp-ipv6" | .settings.domainStrategy = "UseIPv6"')
-                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_ipv6_out" '. + [$out]')
-                        added_warp_ipv6=true
+                        local warp_out_with_strategy=$(echo "$warp_out" | jq --arg tag "$warp_tag" --arg ds "$warp_strategy" \
+                            '.tag = $tag | .settings.domainStrategy = $ds')
+                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_with_strategy" '. + [$out]')
                     fi
-                elif [[ "$ipv6_only" != "true" && "$added_warp" == "false" ]]; then
-                    local warp_out=$(gen_xray_warp_outbound)
-                    [[ -n "$warp_out" ]] && {
-                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out" '. + [$out]')
-                        added_warp=true
-                    }
                 fi
             elif [[ "$outbound" == chain:* ]]; then
                 local node_name="${outbound#chain:}"
-                if [[ "$ipv6_only" == "true" ]]; then
-                    # IPv6 专用链式代理
-                    if [[ -z "${added_chains_ipv6[$node_name]}" ]]; then
-                        local tag="chain-${node_name}-ipv6"
-                        local chain_out=$(gen_xray_chain_outbound "$node_name" "$tag" "ipv6")
-                        [[ -n "$chain_out" ]] && {
-                            outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
-                            added_chains_ipv6[$node_name]=1
-                        }
-                    fi
-                else
-                    # 普通链式代理
-                    if [[ -z "${added_chains[$node_name]}" ]]; then
-                        local tag="chain-${node_name}"
-                        local chain_out=$(gen_xray_chain_outbound "$node_name" "$tag")
-                        [[ -n "$chain_out" ]] && {
-                            outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
-                            added_chains[$node_name]=1
-                        }
-                    fi
+                local tag_suffix=""
+                case "$ip_version" in
+                    ipv4_only) tag_suffix="-ipv4" ;;
+                    ipv6_only) tag_suffix="-ipv6" ;;
+                    prefer_ipv6) tag_suffix="-prefer-ipv6" ;;
+                    prefer_ipv4|*) tag_suffix="-prefer-ipv4" ;;
+                esac
+                local tag="chain-${node_name}${tag_suffix}"
+                # 链式代理支持每种策略一个独立出口
+                if ! echo "$outbounds" | jq -e --arg tag "$tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                    local chain_out=$(gen_xray_chain_outbound "$node_name" "$tag" "$ip_version")
+                    [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
                 fi
             fi
         done < <(echo "$rules" | jq -c '.[]')
@@ -661,10 +681,11 @@ generate_xray_config() {
             jq --argjson rules "$routing_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
         fi
     else
-        jq -n '{
+        # 无分流规则时沿用直连出口配置，确保 direct_ip_version 生效
+        jq -n --argjson direct "$direct_outbound" '{
             log: {loglevel: "warning"},
             inbounds: [],
-            outbounds: [{protocol: "freedom", tag: "direct"}]
+            outbounds: [$direct]
         }' > "$CFG/config.json"
     fi
     
@@ -3350,8 +3371,30 @@ generate_singbox_config() {
     
     mkdir -p "$CFG"
     
+    # 读取直连出口 IP 版本设置，作为 sing-box domain_strategy（默认优先 IPv6）
+    local direct_ip_version="prefer_ipv6"
+    [[ -f "$CFG/direct_ip_version" ]] && direct_ip_version=$(cat "$CFG/direct_ip_version")
+    local direct_domain_strategy=""
+    case "$direct_ip_version" in
+        ipv4_only|ipv6_only|prefer_ipv4|prefer_ipv6)
+            direct_domain_strategy="$direct_ip_version"
+            ;;
+        ipv4)
+            direct_domain_strategy="ipv4_only"
+            ;;
+        ipv6)
+            direct_domain_strategy="ipv6_only"
+            ;;
+    esac
+    
+    # 使用 jq 构建直连出口，避免手写 JSON
+    local direct_outbound=$(jq -n --arg ds "$direct_domain_strategy" '{
+        type: "direct",
+        tag: "direct"
+    } | if $ds != "" then .domain_strategy = $ds else . end')
+    
     # 收集所有需要的出口
-    local outbounds='[{"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}]'
+    local outbounds=$(jq -n --argjson direct "$direct_outbound" '[$direct, {type: "block", tag: "block"}]')
     local routing_rules=""
     local has_routing=false
     
@@ -3360,54 +3403,98 @@ generate_singbox_config() {
     
     if [[ -n "$rules" && "$rules" != "[]" ]]; then
         # 收集所有用到的出口 (支持多出口)
-        local added_warp=false
-        local added_warp_ipv6=false
-        declare -A added_chains  # 记录已添加的链式代理节点
-        declare -A added_chains_ipv6  # 记录已添加的 IPv6 链式代理节点
         
         while IFS= read -r rule_json; do
             [[ -z "$rule_json" ]] && continue
             local outbound=$(echo "$rule_json" | jq -r '.outbound')
-            local ipv6_only=$(echo "$rule_json" | jq -r '.ipv6_only // false')
+            local ip_version=$(echo "$rule_json" | jq -r '.ip_version // "prefer_ipv4"')
             
-            if [[ "$outbound" == "warp" ]]; then
-                if [[ "$ipv6_only" == "true" && "$added_warp_ipv6" == "false" ]]; then
-                    # 生成 WARP IPv6 专用出口
+            if [[ "$outbound" == "direct" ]]; then
+                case "$ip_version" in
+                    ipv4_only)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-ipv4" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_ipv4_out=$(jq -n '{
+                                type: "direct",
+                                tag: "direct-ipv4",
+                                domain_strategy: "ipv4_only"
+                            }')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_ipv4_out" '. + [$out]')
+                        fi
+                        ;;
+                    ipv6_only)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-ipv6" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_ipv6_out=$(jq -n '{
+                                type: "direct",
+                                tag: "direct-ipv6",
+                                domain_strategy: "ipv6_only"
+                            }')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_ipv6_out" '. + [$out]')
+                        fi
+                        ;;
+                    prefer_ipv6)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv6" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_prefer_ipv6_out=$(jq -n '{
+                                type: "direct",
+                                tag: "direct-prefer-ipv6",
+                                domain_strategy: "prefer_ipv6"
+                            }')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv6_out" '. + [$out]')
+                        fi
+                        ;;
+                    prefer_ipv4|*)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv4" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_prefer_ipv4_out=$(jq -n '{
+                                type: "direct",
+                                tag: "direct-prefer-ipv4",
+                                domain_strategy: "prefer_ipv4"
+                            }')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv4_out" '. + [$out]')
+                        fi
+                        ;;
+                esac
+            elif [[ "$outbound" == "warp" ]]; then
+                local warp_tag=""
+                local warp_strategy=""
+                case "$ip_version" in
+                    ipv4_only)
+                        warp_tag="warp-ipv4"
+                        warp_strategy="ipv4_only"
+                        ;;
+                    ipv6_only)
+                        warp_tag="warp-ipv6"
+                        warp_strategy="ipv6_only"
+                        ;;
+                    prefer_ipv6)
+                        warp_tag="warp-prefer-ipv6"
+                        warp_strategy="prefer_ipv6"
+                        ;;
+                    prefer_ipv4|*)
+                        warp_tag="warp-prefer-ipv4"
+                        warp_strategy="prefer_ipv4"
+                        ;;
+                esac
+                if ! echo "$outbounds" | jq -e --arg tag "$warp_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                     local warp_out=$(gen_singbox_warp_outbound)
                     if [[ -n "$warp_out" ]]; then
-                        local warp_ipv6_out=$(echo "$warp_out" | jq '.tag = "warp-ipv6" | .domain_strategy = "ipv6_only"')
-                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_ipv6_out" '. + [$out]')
-                        added_warp_ipv6=true
+                        local warp_out_with_strategy=$(echo "$warp_out" | jq --arg tag "$warp_tag" --arg ds "$warp_strategy" \
+                            '.tag = $tag | .domain_strategy = $ds')
+                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_with_strategy" '. + [$out]')
                     fi
-                elif [[ "$ipv6_only" != "true" && "$added_warp" == "false" ]]; then
-                    local warp_out=$(gen_singbox_warp_outbound)
-                    [[ -n "$warp_out" ]] && {
-                        outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out" '. + [$out]')
-                        added_warp=true
-                    }
                 fi
             elif [[ "$outbound" == chain:* ]]; then
                 local node_name="${outbound#chain:}"
-                if [[ "$ipv6_only" == "true" ]]; then
-                    # IPv6 专用链式代理
-                    if [[ -z "${added_chains_ipv6[$node_name]}" ]]; then
-                        local tag="chain-${node_name}-ipv6"
-                        local chain_out=$(gen_singbox_chain_outbound "$node_name" "$tag" "ipv6")
-                        [[ -n "$chain_out" ]] && {
-                            outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
-                            added_chains_ipv6[$node_name]=1
-                        }
-                    fi
-                else
-                    # 普通链式代理
-                    if [[ -z "${added_chains[$node_name]}" ]]; then
-                        local tag="chain-${node_name}"
-                        local chain_out=$(gen_singbox_chain_outbound "$node_name" "$tag")
-                        [[ -n "$chain_out" ]] && {
-                            outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
-                            added_chains[$node_name]=1
-                        }
-                    fi
+                local tag_suffix=""
+                case "$ip_version" in
+                    ipv4_only) tag_suffix="-ipv4" ;;
+                    ipv6_only) tag_suffix="-ipv6" ;;
+                    prefer_ipv6) tag_suffix="-prefer-ipv6" ;;
+                    prefer_ipv4|*) tag_suffix="-prefer-ipv4" ;;
+                esac
+                local tag="chain-${node_name}${tag_suffix}"
+                # 链式代理支持每种策略一个独立出口
+                if ! echo "$outbounds" | jq -e --arg tag "$tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                    local chain_out=$(gen_singbox_chain_outbound "$node_name" "$tag" "$ip_version")
+                    [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
                 fi
             fi
         done < <(echo "$rules" | jq -c '.[]')
@@ -3431,10 +3518,10 @@ generate_singbox_config() {
             base_config=$(echo "$base_config" | jq --argjson rules "$routing_rules" '.route.rules = $rules')
         fi
     else
-        base_config=$(jq -n '{
+        base_config=$(jq -n --argjson direct "$direct_outbound" '{
             log: {level: "warn", timestamp: true},
             inbounds: [],
-            outbounds: [{type: "direct", tag: "direct"}]
+            outbounds: [$direct]
         }')
     fi
     
@@ -5808,8 +5895,8 @@ db_add_routing_rule() {
     local rule_domains="$domains"
     [[ "$rule_type" != "custom" && "$rule_type" != "all" ]] && rule_domains="${ROUTING_PRESETS[$rule_type]:-}"
     
-    # 获取 IPv6 only 选项 (第4个参数)
-    local ipv6_only="${4:-false}"
+    # 获取 IP 版本选项 (第4个参数)
+    local ip_version="${4:-prefer_ipv4}"
     
     local tmp=$(mktemp)
     
@@ -5822,41 +5909,41 @@ db_add_routing_rule() {
     if [[ "$rule_type" == "custom" ]]; then
         if [[ "$outbound" == "direct" ]]; then
             # 直连的 custom 规则插入到最开头
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ipv6 "$ipv6_only" \
-                '.routing_rules = ([{id: $id, type: $type, outbound: $out, domains: $domains, ipv6_only: ($ipv6 == "true")}] + (.routing_rules // []))' \
+            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
+                '.routing_rules = ([{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] + (.routing_rules // []))' \
                 "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
         else
             # 非直连的 custom 规则插入到直连规则之后
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ipv6 "$ipv6_only" \
+            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
                 '.routing_rules = (
                     ((.routing_rules // []) | map(select(.outbound == "direct"))) + 
-                    [{id: $id, type: $type, outbound: $out, domains: $domains, ipv6_only: ($ipv6 == "true")}] +
+                    [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] +
                     ((.routing_rules // []) | map(select(.outbound != "direct")))
                 )' \
                 "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
         fi
     elif [[ "$rule_type" == "all" ]]; then
         # all 规则追加到末尾，优先级最低
-        jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ipv6 "$ipv6_only" \
-            '.routing_rules = ((.routing_rules // []) | map(select(.type != $type))) + [{id: $id, type: $type, outbound: $out, domains: $domains, ipv6_only: ($ipv6 == "true")}]' \
+        jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
+            '.routing_rules = ((.routing_rules // []) | map(select(.type != $type))) + [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}]' \
             "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
     else
         # 预设规则：删除同类型旧规则
         if [[ "$outbound" == "direct" ]]; then
             # 直连的预设规则插入到最开头
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ipv6 "$ipv6_only" \
+            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
                 '.routing_rules = (
-                    [{id: $id, type: $type, outbound: $out, domains: $domains, ipv6_only: ($ipv6 == "true")}] +
+                    [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] +
                     ((.routing_rules // []) | map(select(.type != $type)))
                 )' \
                 "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
         else
             # 非直连的预设规则：插入到直连和 custom 规则之后
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ipv6 "$ipv6_only" \
+            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
                 '.routing_rules = (
                     ((.routing_rules // []) | map(select(.outbound == "direct"))) + 
                     ((.routing_rules // []) | map(select(.type == "custom" and .outbound != "direct"))) + 
-                    [{id: $id, type: $type, outbound: $out, domains: $domains, ipv6_only: ($ipv6 == "true")}] +
+                    [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] +
                     ((.routing_rules // []) | map(select(.type != "custom" and .type != $type and .outbound != "direct")))
                 )' \
                 "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
@@ -6083,30 +6170,34 @@ gen_xray_routing_rules() {
         local rule_type=$(echo "$rule" | jq -r '.type')
         local outbound=$(echo "$rule" | jq -r '.outbound')
         local domains=$(echo "$rule" | jq -r '.domains // ""')
-        local ipv6_only=$(echo "$rule" | jq -r '.ipv6_only // false')
+        local ip_version=$(echo "$rule" | jq -r '.ip_version // "prefer_ipv4"')
         
         # 转换出口标识为 tag
         local tag="$outbound"
         if [[ "$outbound" == "direct" ]]; then
-            tag="direct"
-            # 直连的 IPv6 模式使用专用出口
-            if [[ "$ipv6_only" == "true" ]]; then
-                tag="direct-ipv6"
-            fi
+            case "$ip_version" in
+                ipv4_only) tag="direct-ipv4" ;;
+                ipv6_only) tag="direct-ipv6" ;;
+                prefer_ipv6) tag="direct-prefer-ipv6" ;;
+                *) tag="direct-prefer-ipv4" ;;
+            esac
         elif [[ "$outbound" == "warp" ]]; then
-            tag="warp"
-            if [[ "$ipv6_only" == "true" ]]; then
-                tag="warp-ipv6"
-            fi
+            case "$ip_version" in
+                ipv4_only) tag="warp-ipv4" ;;
+                ipv6_only) tag="warp-ipv6" ;;
+                prefer_ipv6) tag="warp-prefer-ipv6" ;;
+                *) tag="warp-prefer-ipv4" ;;
+            esac
         elif [[ "$outbound" == "block" ]]; then
             tag="block"
         elif [[ "$outbound" == chain:* ]]; then
-            # 多出口：每个节点有独立的 tag，格式为 chain-节点名
             local node_name="${outbound#chain:}"
-            tag="chain-${node_name}"
-            if [[ "$ipv6_only" == "true" ]]; then
-                tag="${tag}-ipv6"
-            fi
+            case "$ip_version" in
+                ipv4_only) tag="chain-${node_name}-ipv4" ;;
+                ipv6_only) tag="chain-${node_name}-ipv6" ;;
+                prefer_ipv6) tag="chain-${node_name}-prefer-ipv6" ;;
+                *) tag="chain-${node_name}-prefer-ipv4" ;;
+            esac
         fi
         
         if [[ "$rule_type" == "all" ]]; then
@@ -6175,22 +6266,34 @@ gen_singbox_routing_rules() {
         local rule_type=$(echo "$rule" | jq -r '.type')
         local outbound=$(echo "$rule" | jq -r '.outbound')
         local domains=$(echo "$rule" | jq -r '.domains // ""')
-        local ipv6_only=$(echo "$rule" | jq -r '.ipv6_only // false')
+        local ip_version=$(echo "$rule" | jq -r '.ip_version // "prefer_ipv4"')
         
         # 转换出口标识为 tag
         local tag="$outbound"
-        if [[ "$outbound" == "warp" ]]; then
-            tag="warp"
+        if [[ "$outbound" == "direct" ]]; then
+            case "$ip_version" in
+                ipv4_only) tag="direct-ipv4" ;;
+                ipv6_only) tag="direct-ipv6" ;;
+                prefer_ipv6) tag="direct-prefer-ipv6" ;;
+                *) tag="direct-prefer-ipv4" ;;
+            esac
+        elif [[ "$outbound" == "warp" ]]; then
+            case "$ip_version" in
+                ipv4_only) tag="warp-ipv4" ;;
+                ipv6_only) tag="warp-ipv6" ;;
+                prefer_ipv6) tag="warp-prefer-ipv6" ;;
+                *) tag="warp-prefer-ipv4" ;;
+            esac
         elif [[ "$outbound" == "block" ]]; then
             tag="block"
         elif [[ "$outbound" == chain:* ]]; then
             local node_name="${outbound#chain:}"
-            tag="chain-${node_name}"
-        fi
-        
-        # IPv6 only 模式：使用专用的 IPv6 出口
-        if [[ "$ipv6_only" == "true" ]]; then
-            tag="${tag}-ipv6"
+            case "$ip_version" in
+                ipv4_only) tag="chain-${node_name}-ipv4" ;;
+                ipv6_only) tag="chain-${node_name}-ipv6" ;;
+                prefer_ipv6) tag="chain-${node_name}-prefer-ipv6" ;;
+                *) tag="chain-${node_name}-prefer-ipv4" ;;
+            esac
         fi
         
         if [[ "$rule_type" == "all" ]]; then
@@ -6307,16 +6410,17 @@ show_routing_status() {
     echo -e "  ${C}出口状态${NC}"
     _line
     
-    # 直连出口 IP 版本
-    local direct_ip_version="auto"
+    # 直连出口 IP 版本（默认优先 IPv6）
+    local direct_ip_version="prefer_ipv6"
     [[ -f "$CFG/direct_ip_version" ]] && direct_ip_version=$(cat "$CFG/direct_ip_version")
     local direct_display=""
     case "$direct_ip_version" in
-        auto) direct_display="自动" ;;
-        ipv4) direct_display="仅 IPv4" ;;
-        ipv6) direct_display="仅 IPv6" ;;
+        ipv4|ipv4_only) direct_display="仅 IPv4" ;;
+        ipv6|ipv6_only) direct_display="仅 IPv6" ;;
         prefer_ipv4) direct_display="优先 IPv4" ;;
         prefer_ipv6) direct_display="优先 IPv6" ;;
+        # 兜底展示异常值，避免界面空白
+        *) direct_display="${Y}未知 ($direct_ip_version)${NC}" ;;
     esac
     echo -e "  直连: ${G}$direct_display${NC}"
     
@@ -6354,8 +6458,8 @@ show_routing_status() {
     
     if [[ -n "$rules" && "$rules" != "[]" ]]; then
         local rule_count=0
-        # 一次性提取 type, outbound, domains, ipv6_only，用 | 分隔
-        while IFS='|' read -r rule_type outbound domains ipv6_only; do
+        # 一次性提取 type, outbound, domains, ip_version，用 | 分隔
+        while IFS='|' read -r rule_type outbound domains ip_version; do
             [[ -z "$rule_type" ]] && continue
             local outbound_name=$(_get_outbound_display_name "$outbound")
             
@@ -6375,20 +6479,25 @@ show_routing_status() {
             [[ "$rule_type" == "all" ]] && rule_name="所有流量"
             [[ "$rule_type" == "ads" ]] && rule_name="广告屏蔽"
             
-            # IPv6 标记
-            local ipv6_mark=""
-            [[ "$ipv6_only" == "true" ]] && ipv6_mark=" ${C}[IPv6]${NC}"
+            # IP 版本标记
+            local ip_mark=""
+            case "$ip_version" in
+                ipv4_only) ip_mark=" ${C}[仅IPv4]${NC}" ;;
+                ipv6_only) ip_mark=" ${C}[仅IPv6]${NC}" ;;
+                prefer_ipv4) ip_mark=" ${C}[优先IPv4]${NC}" ;;
+                prefer_ipv6) ip_mark=" ${C}[优先IPv6]${NC}" ;;
+            esac
             
             if [[ "$rule_type" == "all" ]]; then
-                echo -e "  ${Y}●${NC} ${rule_name} → ${C}${outbound_name}${NC}${ipv6_mark}"
+                echo -e "  ${Y}●${NC} ${rule_name} → ${C}${outbound_name}${NC}${ip_mark}"
             elif [[ "$rule_type" == "ads" ]]; then
                 echo -e "  ${R}●${NC} ${rule_name} → ${D}拦截${NC}"
             else
-                echo -e "  ${G}●${NC} ${rule_name} → ${C}${outbound_name}${NC}${ipv6_mark}"
+                echo -e "  ${G}●${NC} ${rule_name} → ${C}${outbound_name}${NC}${ip_mark}"
             fi
             
             ((rule_count++))
-        done < <(echo "$rules" | jq -r '.[] | "\(.type)|\(.outbound)|\(.domains // "")|\(.ipv6_only // false)"')
+        done < <(echo "$rules" | jq -r '.[] | "\(.type)|\(.outbound)|\(.domains // "")|\(.ip_version // "prefer_ipv4")"')
         
         [[ $rule_count -eq 0 ]] && echo -e "  ${D}未配置分流规则${NC}"
     else
@@ -6600,20 +6709,28 @@ _add_routing_rule() {
     local outbound=$(_select_outbound "选择出口")
     [[ -z "$outbound" ]] && return
     
-    # 询问是否仅使用 IPv6 出站
-    local ipv6_only="false"
+    # 选择出口 IP 版本
     echo ""
-    echo -e "  ${Y}出站 IP 版本:${NC}"
-    echo -e "  ${G}1)${NC} 默认 (系统自动选择，通常 IPv4 优先)"
-    echo -e "  ${G}2)${NC} 仅 IPv6 (适合解锁 Netflix 等)"
-    read -rp "  请选择 [1-2，默认 1]: " ip_version_choice
-    [[ "$ip_version_choice" == "2" ]] && ipv6_only="true"
+    echo -e "  ${Y}出站方式:${NC}"
+    echo -e "  ${G}1)${NC} 仅 IPv4（IPv6 受限或不稳定环境）"
+    echo -e "  ${G}2)${NC} 仅 IPv6（解锁 Netflix，避免同户检测）"
+    echo -e "  ${G}3)${NC} 优先 IPv4（确保兼容性）"
+    echo -e "  ${G}4)${NC} 优先 IPv6（双栈环境，优先 IPv6）"
+    read -rp "  请选择 [1-4，默认 3]: " ip_version_choice
+    
+    local ip_version="prefer_ipv4"  # 默认值
+    case "$ip_version_choice" in
+        1) ip_version="ipv4_only" ;;
+        2) ip_version="ipv6_only" ;;
+        3) ip_version="prefer_ipv4" ;;
+        4) ip_version="prefer_ipv6" ;;
+    esac
     
     # 保存规则
     if [[ "$rule_type" == "custom" ]]; then
-        db_add_routing_rule "$rule_type" "$outbound" "$custom_domains" "$ipv6_only"
+        db_add_routing_rule "$rule_type" "$outbound" "$custom_domains" "$ip_version"
     else
-        db_add_routing_rule "$rule_type" "$outbound" "" "$ipv6_only"
+        db_add_routing_rule "$rule_type" "$outbound" "" "$ip_version"
     fi
     
     local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
@@ -6621,11 +6738,16 @@ _add_routing_rule() {
     [[ "$rule_type" == "all" ]] && rule_name="所有流量"
     local outbound_name=$(_get_outbound_display_name "$outbound")
     
-    # 显示 IPv6 标记
-    local ipv6_mark=""
-    [[ "$ipv6_only" == "true" ]] && ipv6_mark=" (IPv6)"
+    # 显示 IP 版本标记
+    local ip_version_mark=""
+    case "$ip_version" in
+        ipv4_only) ip_version_mark=" ${C}[仅IPv4]${NC}" ;;
+        ipv6_only) ip_version_mark=" ${C}[仅IPv6]${NC}" ;;
+        prefer_ipv4) ip_version_mark=" ${C}[优先IPv4]${NC}" ;;
+        prefer_ipv6) ip_version_mark=" ${C}[优先IPv6]${NC}" ;;
+    esac
     
-    _ok "已添加规则: ${rule_name} → ${outbound_name}${ipv6_mark}"
+    _ok "已添加规则: ${rule_name} → ${outbound_name}${ip_version_mark}"
     
     # 更新配置
     _info "更新代理配置..."
@@ -7900,17 +8022,16 @@ configure_direct_outbound() {
     echo -e "  ${D}适用于双栈服务器选择出口 IP${NC}"
     echo ""
     
-    # 读取当前设置
-    local current="auto"
+    # 读取当前设置，默认优先 IPv6
+    local current="prefer_ipv6"
     [[ -f "$CFG/direct_ip_version" ]] && current=$(cat "$CFG/direct_ip_version")
     
     echo -e "  当前设置: ${G}$current${NC}"
     echo ""
-    _item "1" "自动 (系统默认)"
-    _item "2" "仅 IPv4"
-    _item "3" "仅 IPv6"
-    _item "4" "优先 IPv4"
-    _item "5" "优先 IPv6"
+    _item "1" "仅 IPv4（IPv6 受限或不稳定环境）"
+    _item "2" "仅 IPv6（双栈环境，强制 IPv6）"
+    _item "3" "优先 IPv4（默认，确保兼容性）"
+    _item "4" "优先 IPv6（双栈环境，优先 IPv6）"
     _item "0" "返回"
     _line
     
@@ -7918,11 +8039,10 @@ configure_direct_outbound() {
     
     local new_setting=""
     case "$choice" in
-        1) new_setting="auto" ;;
-        2) new_setting="ipv4" ;;
-        3) new_setting="ipv6" ;;
-        4) new_setting="prefer_ipv4" ;;
-        5) new_setting="prefer_ipv6" ;;
+        1) new_setting="ipv4_only" ;;
+        2) new_setting="ipv6_only" ;;
+        3) new_setting="prefer_ipv4" ;;
+        4) new_setting="prefer_ipv6" ;;
         0|"") return ;;
         *) _warn "无效选项"; return ;;
     esac
@@ -7938,6 +8058,16 @@ configure_direct_outbound() {
         generate_xray_config
         svc start vless-reality 2>/dev/null
         _ok "配置已更新"
+    fi
+
+    # 与 Xray 保持一致，同步更新 Sing-box 配置
+    local singbox_protocols=$(get_singbox_protocols)
+    if [[ -n "$singbox_protocols" ]]; then
+        _info "重新生成 Sing-box 配置..."
+        svc stop vless-singbox 2>/dev/null
+        generate_singbox_config
+        svc start vless-singbox 2>/dev/null
+        _ok "Sing-box 配置已更新"
     fi
     
     _pause
@@ -8547,9 +8677,9 @@ gen_xray_chain_outbound() {
     port=$(echo "$port" | tr -d '"' | tr -d ' ')
     [[ ! "$port" =~ ^[0-9]+$ ]] && { echo ""; return 1; }
     
-    # IPv6 only 模式的 domainStrategy
+    # IPv6 优先模式的 domainStrategy
     local domain_strategy=""
-    [[ "$ip_mode" == "ipv6" ]] && domain_strategy="UseIPv6"
+    [[ "$ip_mode" == "ipv6" ]] && domain_strategy="PreferIPv6"
     
     case "$type" in
         socks)
@@ -8679,7 +8809,7 @@ gen_xray_chain_outbound() {
 
 # 生成 Sing-box 链式代理 outbound (支持指定节点名和自定义 tag)
 # 用法: gen_singbox_chain_outbound [节点名] [tag] [ip_mode]
-# 第三个参数 ip_mode: 可选 "ipv6" 表示仅使用 IPv6
+# 第三个参数 ip_mode: 可选 "ipv6" 表示优先使用 IPv6
 gen_singbox_chain_outbound() {
     local node_name="${1:-$(db_get_chain_active)}"
     local tag="${2:-chain}"
@@ -8695,7 +8825,7 @@ gen_singbox_chain_outbound() {
     
     # 根据 ip_mode 设置 domain_strategy
     local domain_strategy="prefer_ipv4"
-    [[ "$ip_mode" == "ipv6" ]] && domain_strategy="ipv6_only"
+    [[ "$ip_mode" == "ipv6" ]] && domain_strategy="prefer_ipv6"
     
     case "$type" in
         socks)

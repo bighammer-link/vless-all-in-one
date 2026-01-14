@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.1.11 [服务端]
+#  多协议代理一键部署脚本 v3.2.0 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.1.11"
+readonly VERSION="3.2.0"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -366,7 +366,7 @@ SHOW_JOIN_CODE="off"
 #═══════════════════════════════════════════════════════════════════════════════
 
 # 颜色
-R='\e[31m'; G='\e[32m'; Y='\e[33m'; C='\e[36m'; W='\e[97m'; D='\e[2m'; NC='\e[0m'
+R='\e[31m'; G='\e[32m'; Y='\e[33m'; C='\e[36m'; M='\e[35m'; W='\e[97m'; D='\e[2m'; NC='\e[0m'
 set -o pipefail
 
 # 日志文件
@@ -1382,6 +1382,23 @@ check_dependencies() {
             fi
         done
         _ok "依赖安装完成"
+    fi
+    return 0
+}
+
+# 核心更新依赖检查（避免版本获取失败）
+_check_core_update_deps() {
+    local missing=()
+    local cmd
+    for cmd in curl jq; do
+        if ! check_cmd "$cmd"; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -ne 0 ]]; then
+        _err "缺少依赖: ${missing[*]}"
+        _warn "请先在主菜单执行“检测基础依赖”或手动安装依赖后重试"
+        return 1
     fi
     return 0
 }
@@ -3511,10 +3528,338 @@ fix_selinux_context() {
     fi
 }
 
-# 获取 GitHub 最新版本号
+# GitHub API 请求配置
+readonly GITHUB_API_PER_PAGE=30
+readonly VERSION_CACHE_DIR="/tmp/vless-version-cache"
+readonly VERSION_CACHE_TTL=3600  # 缓存1小时
+
+# 获取文件修改时间戳（跨平台兼容）
+_get_file_mtime() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return 1
+
+    # 尝试 Linux 格式
+    if stat -c %Y "$file" 2>/dev/null; then
+        return 0
+    fi
+
+    # 尝试 macOS/BSD 格式
+    if stat -f %m "$file" 2>/dev/null; then
+        return 0
+    fi
+
+    # 都失败则返回错误
+    return 1
+}
+
+# 初始化版本缓存目录
+_init_version_cache() {
+    mkdir -p "$VERSION_CACHE_DIR" 2>/dev/null || true
+}
+
+# 获取缓存的版本号
+_get_cached_version() {
+    local repo="$1"
+    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
+
+    # 检查缓存文件是否存在且未过期
+    if [[ -f "$cache_file" ]]; then
+        local cache_time
+        cache_time=$(_get_file_mtime "$cache_file")
+        if [[ -n "$cache_time" ]]; then
+            local current_time=$(date +%s)
+            local age=$((current_time - cache_time))
+
+            if [[ $age -lt $VERSION_CACHE_TTL ]]; then
+                cat "$cache_file"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+# 获取缓存的测试版版本号
+_get_cached_prerelease_version() {
+    local repo="$1"
+    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
+
+    # 检查缓存文件是否存在且未过期
+    if [[ -f "$cache_file" ]]; then
+        local cache_time
+        cache_time=$(_get_file_mtime "$cache_file")
+        if [[ -n "$cache_time" ]]; then
+            local current_time=$(date +%s)
+            local age=$((current_time - cache_time))
+
+            if [[ $age -lt $VERSION_CACHE_TTL ]]; then
+                cat "$cache_file"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+# 保存版本号到缓存
+_save_version_cache() {
+    local repo="$1"
+    local version="$2"
+    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
+    echo "$version" > "$cache_file" 2>/dev/null || true
+}
+
+# 后台异步更新版本缓存
+_update_version_cache_async() {
+    local repo="$1"
+    (
+        local version
+        version=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+        if [[ -n "$version" ]]; then
+            _save_version_cache "$repo" "$version"
+        fi
+    ) &
+}
+
+# 后台异步更新测试版版本缓存
+_update_prerelease_cache_async() {
+    local repo="$1"
+    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
+    (
+        local version
+        version=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases?per_page=$GITHUB_API_PER_PAGE" 2>/dev/null | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
+        if [[ -n "$version" ]]; then
+            echo "$version" > "$cache_file" 2>/dev/null || true
+        fi
+    ) &
+}
+
+# 后台异步更新所有版本缓存（稳定版+测试版，一次请求）
+_update_all_versions_async() {
+    local repo="$1"
+    local stable_cache="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
+    local prerelease_cache="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
+    (
+        # 一次请求获取最近10个版本（足够覆盖最新稳定版和测试版）
+        local releases
+        releases=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases?per_page=10" 2>/dev/null)
+        if [[ -n "$releases" ]]; then
+            # 提取稳定版（第一个非prerelease）
+            local stable_version
+            stable_version=$(echo "$releases" | jq -r '[.[] | select(.prerelease == false)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
+            [[ -n "$stable_version" ]] && echo "$stable_version" > "$stable_cache" 2>/dev/null
+
+            # 提取测试版（第一个prerelease）
+            local prerelease_version
+            prerelease_version=$(echo "$releases" | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
+            [[ -n "$prerelease_version" ]] && echo "$prerelease_version" > "$prerelease_cache" 2>/dev/null
+        fi
+    ) &
+}
+
+# 获取 GitHub 最新版本号 (带缓存)
 _get_latest_version() {
     local repo="$1"
-    curl -sL "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//'
+    local use_cache="${2:-true}"
+
+    # 初始化缓存目录
+    _init_version_cache
+
+    # 如果启用缓存,先尝试从缓存读取
+    if [[ "$use_cache" == "true" ]]; then
+        local cached_version
+        if cached_version=$(_get_cached_version "$repo"); then
+            echo "$cached_version"
+            # 后台异步更新缓存
+            _update_version_cache_async "$repo"
+            return 0
+        fi
+    fi
+
+    # 缓存未命中或禁用缓存,执行网络请求
+    local result
+    result=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases/latest" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        # 网络请求失败时不显示错误,返回空
+        return 1
+    fi
+    local version
+    version=$(echo "$result" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+    if [[ -z "$version" ]]; then
+        return 1
+    fi
+
+    # 保存到缓存
+    _save_version_cache "$repo" "$version"
+    echo "$version"
+}
+
+# 后台异步检查版本更新（用于菜单刷新）
+_check_version_updates_async() {
+    local xray_ver="$1"
+    local singbox_ver="$2"
+    local update_flag_file="$VERSION_CACHE_DIR/.update_available"
+
+    # 清除旧的更新标记
+    rm -f "$update_flag_file" "${update_flag_file}.done" 2>/dev/null
+
+    (
+        local has_update=false
+        local xray_cached="" singbox_cached=""
+
+        # 优先从缓存获取最新版本号（立即可用）
+        if [[ "$xray_ver" != "未安装" ]] && [[ "$xray_ver" != "未知" ]]; then
+            xray_cached=$(_get_cached_version "XTLS/Xray-core" 2>/dev/null)
+            if [[ -n "$xray_cached" ]] && [[ "$xray_ver" != "$xray_cached" ]]; then
+                has_update=true
+                echo "xray:$xray_cached" >> "$update_flag_file"
+            fi
+        fi
+
+        if [[ "$singbox_ver" != "未安装" ]] && [[ "$singbox_ver" != "未知" ]]; then
+            singbox_cached=$(_get_cached_version "SagerNet/sing-box" 2>/dev/null)
+            if [[ -n "$singbox_cached" ]] && [[ "$singbox_ver" != "$singbox_cached" ]]; then
+                has_update=true
+                echo "singbox:$singbox_cached" >> "$update_flag_file"
+            fi
+        fi
+
+        # 如果缓存中有更新，立即标记完成（极速显示）
+        if [[ "$has_update" == "true" ]]; then
+            touch "${update_flag_file}.done"
+        fi
+
+        # 然后后台异步更新缓存（为下次访问准备）
+        if [[ "$xray_ver" != "未安装" ]] && [[ "$xray_ver" != "未知" ]]; then
+            _update_version_cache_async "XTLS/Xray-core"
+        fi
+        if [[ "$singbox_ver" != "未安装" ]] && [[ "$singbox_ver" != "未知" ]]; then
+            _update_version_cache_async "SagerNet/sing-box"
+        fi
+    ) &
+}
+
+# 检查是否有版本更新（非阻塞）
+_has_version_updates() {
+    local update_flag_file="$VERSION_CACHE_DIR/.update_available"
+    [[ -f "${update_flag_file}.done" ]]
+}
+
+# 获取版本更新信息
+_get_version_update_info() {
+    local core="$1"  # xray 或 singbox
+    local update_flag_file="$VERSION_CACHE_DIR/.update_available"
+
+    if [[ -f "$update_flag_file" ]]; then
+        grep "^${core}:" "$update_flag_file" 2>/dev/null | cut -d':' -f2
+    fi
+}
+
+# 获取 GitHub 最新测试版版本号 (pre-release，带缓存)
+_get_latest_prerelease_version() {
+    local repo="$1"
+    local use_cache="${2:-true}"
+    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
+
+    # 初始化缓存目录
+    _init_version_cache
+
+    # 如果启用缓存,先尝试从缓存读取
+    if [[ "$use_cache" == "true" ]] && [[ -f "$cache_file" ]]; then
+        local cache_time
+        cache_time=$(_get_file_mtime "$cache_file")
+        if [[ -n "$cache_time" ]]; then
+            local current_time=$(date +%s)
+            local age=$((current_time - cache_time))
+
+            if [[ $age -lt $VERSION_CACHE_TTL ]]; then
+                cat "$cache_file"
+                # 后台异步更新
+                (
+                    local version
+                    version=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases?per_page=$GITHUB_API_PER_PAGE" 2>/dev/null | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
+                    if [[ -n "$version" ]]; then
+                        echo "$version" > "$cache_file" 2>/dev/null || true
+                    fi
+                ) &
+                return 0
+            fi
+        fi
+    fi
+
+    # 缓存未命中,执行网络请求
+    local result
+    result=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases?per_page=$GITHUB_API_PER_PAGE" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        # 网络请求失败时静默返回（不显示错误）
+        return 1
+    fi
+    local version
+    version=$(echo "$result" | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
+    if [[ -z "$version" ]]; then
+        # 未找到测试版时静默返回（可能该项目没有测试版）
+        return 1
+    fi
+
+    # 保存到缓存
+    echo "$version" > "$cache_file" 2>/dev/null || true
+    echo "$version"
+}
+
+# 获取最近版本列表
+_get_release_versions() {
+    local repo="$1" limit="${2:-10}" mode="${3:-stable}"
+    local filter
+    case "$mode" in
+        prerelease|test|beta) filter='[.[] | select(.prerelease == true)]' ;;
+        stable) filter='[.[] | select(.prerelease == false)]' ;;
+        all) filter='[.[]]' ;;
+    esac
+    local result
+    result=$(curl -sL "https://api.github.com/repos/$repo/releases?per_page=$GITHUB_API_PER_PAGE" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        _err "网络请求失败,请检查网络连接"
+        return 1
+    fi
+    local versions
+    versions=$(echo "$result" | jq -r "$filter | .[0:$limit][] | .tag_name // empty" 2>/dev/null | sed 's/^v//')
+    if [[ -z "$versions" ]]; then
+        _err "未找到版本列表或解析失败"
+        return 1
+    fi
+    echo "$versions"
+}
+
+# 获取版本变更日志
+_get_release_changelog() {
+    local repo="$1" version="$2"
+    local tag="v$version"
+    local result
+    result=$(curl -sL "https://api.github.com/repos/$repo/releases/tags/$tag" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+    echo "$result" | jq -r '.body // empty' 2>/dev/null
+}
+
+# 展示变更日志 (简化版)
+_show_changelog_summary() {
+    local repo="$1" version="$2" max_lines="${3:-10}"
+    local changelog
+    changelog=$(_get_release_changelog "$repo" "$version")
+    if [[ -z "$changelog" ]]; then
+        echo "  (无变更日志)"
+        return
+    fi
+
+    echo -e "\n  ${C}变更摘要 (v${version})${NC}"
+    _line
+    echo "$changelog" | head -n "$max_lines" | while IFS= read -r line; do
+        # 简化 Markdown 格式
+        line=$(echo "$line" | sed 's/^### /  ▸ /; s/^## /▸ /; s/^\* /  • /; s/^- /  • /')
+        echo "$line"
+    done
+    _line
 }
 
 # 架构映射 (减少重复代码)
@@ -3534,28 +3879,86 @@ _map_arch() {
 # 通用二进制下载安装函数
 _install_binary() {
     local name="$1" repo="$2" url_pattern="$3" extract_cmd="$4"
-    check_cmd "$name" && { _ok "$name 已安装"; return 0; }
+    local channel="${5:-stable}" force="${6:-false}" version_override="${7:-}"
+    local exists=false action="安装" channel_label="稳定版"
     
-    _info "安装 $name (获取最新版本)..."
-    local version=$(_get_latest_version "$repo")
-    [[ -z "$version" ]] && { _err "获取 $name 版本失败"; return 1; }
-    
-    local arch=$(uname -m)
-    local tmp=$(mktemp -d)
-    local url=$(eval echo "$url_pattern")
-    
-    if curl -sLo "$tmp/pkg" --connect-timeout 60 "$url"; then
-        eval "$extract_cmd"
-        rm -rf "$tmp"
-        _ok "$name v$version 已安装"
-        return 0
+    if check_cmd "$name"; then
+        exists=true
+        [[ "$force" != "true" ]] && { _ok "$name 已安装"; return 0; }
     fi
+    
+    [[ "$exists" == "true" ]] && action="更新"
+    [[ "$channel" == "prerelease" || "$channel" == "test" || "$channel" == "beta" ]] && channel_label="测试版"
+    
+    local version=""
+    if [[ -n "$version_override" ]]; then
+        _info "$action $name (版本 v$version_override)..."
+        version="$version_override"
+    else
+        _info "$action $name (获取最新${channel_label})..."
+        # 实际安装/更新时不使用缓存，获取最新版本
+        if [[ "$channel" == "prerelease" || "$channel" == "test" || "$channel" == "beta" ]]; then
+            version=$(_get_latest_prerelease_version "$repo" "false")
+        else
+            version=$(_get_latest_version "$repo" "false")
+        fi
+        if [[ -z "$version" ]]; then
+            local cached_version=""
+            if [[ "$channel" == "prerelease" || "$channel" == "test" || "$channel" == "beta" ]]; then
+                cached_version=$(_get_cached_prerelease_version "$repo" 2>/dev/null)
+            else
+                cached_version=$(_get_cached_version "$repo" 2>/dev/null)
+            fi
+            if [[ -n "$cached_version" ]]; then
+                _warn "获取最新${channel_label}失败，使用缓存版本 v$cached_version"
+                version="$cached_version"
+            fi
+        fi
+    fi
+    if [[ -z "$version" ]]; then
+        _err "获取 $name 版本失败"
+        _warn "请检查网络/证书/DNS，或先执行“检测基础依赖”"
+        return 1
+    fi
+
+    # 验证版本号，防止命令注入
+    if [[ ! "$version" =~ ^[0-9A-Za-z._-]+$ ]]; then
+        _err "无效的版本号格式: $version"
+        return 1
+    fi
+
+    local arch=$(uname -m)
+    local tmp
+    tmp=$(mktemp -d) || { _err "创建临时目录失败"; return 1; }
+
+    # 安全地构建 URL（避免 eval）
+    local url="${url_pattern//\$version/$version}"
+    url="${url//\$\{xarch\}/$xarch}"
+    url="${url//\$\{sarch\}/$sarch}"
+
+    # 下载并验证
+    if ! curl -fsSL --connect-timeout 60 --retry 2 -o "$tmp/pkg" "$url"; then
+        rm -rf "$tmp"
+        _err "下载 $name 失败: $url"
+        return 1
+    fi
+
+    # 执行解压安装（仍需 eval 但在受控环境）
+    if ! eval "$extract_cmd" 2>/dev/null; then
+        rm -rf "$tmp"
+        _err "安装 $name 失败（解压或文件操作错误）"
+        return 1
+    fi
+
     rm -rf "$tmp"
-    _err "下载 $name 失败"
-    return 1
+    _ok "$name v$version 已安装"
+    return 0
 }
 
 install_xray() {
+    local channel="${1:-stable}"
+    local force="${2:-false}"
+    local version_override="${3:-}"
     local xarch=$(_map_arch "64:arm64-v8a:arm32-v7a") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -3563,7 +3966,8 @@ install_xray() {
     fi
     _install_binary "xray" "XTLS/Xray-core" \
         'https://github.com/XTLS/Xray-core/releases/download/v$version/Xray-linux-${xarch}.zip' \
-        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null; fix_selinux_context'
+        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null; fix_selinux_context' \
+        "$channel" "$force" "$version_override"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -3571,6 +3975,9 @@ install_xray() {
 #═══════════════════════════════════════════════════════════════════════════════
 
 install_singbox() {
+    local channel="${1:-stable}"
+    local force="${2:-false}"
+    local version_override="${3:-}"
     local sarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -3578,7 +3985,603 @@ install_singbox() {
     fi
     _install_binary "sing-box" "SagerNet/sing-box" \
         'https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-${sarch}.tar.gz' \
-        'tar -xzf "$tmp/pkg" -C "$tmp/" && install -m 755 "$(find "$tmp" -name sing-box -type f | head -1)" /usr/local/bin/sing-box'
+        'tar -xzf "$tmp/pkg" -C "$tmp/" && install -m 755 "$(find "$tmp" -name sing-box -type f | head -1)" /usr/local/bin/sing-box' \
+        "$channel" "$force" "$version_override"
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# 核心更新 (Xray/Sing-box)
+#═══════════════════════════════════════════════════════════════════════════════
+
+_core_channel_label() {
+    local channel="$1"
+    case "$channel" in
+        prerelease|test|beta) echo "测试版" ;;
+        *) echo "稳定版" ;;
+    esac
+}
+
+_confirm_core_update() {
+    local core="$1" channel="$2"
+    local channel_label=$(_core_channel_label "$channel")
+    echo "⚠️ 危险操作检测！"
+    echo "操作类型：更新 ${core} 内核（${channel_label}）"
+    echo "影响范围：${core} 二进制与相关服务，更新后需重启服务"
+    echo "风险评估：测试版可能不稳定，更新失败可能导致服务不可用"
+    echo ""
+    read -rp "请确认是否继续？[y/N]: " confirm
+    case "${confirm,,}" in
+        y|yes) return 0 ;;
+        *) _warn "已取消"; return 1 ;;
+    esac
+}
+
+_confirm_core_update_version() {
+    local core="$1" channel="$2" version="$3"
+    local channel_label=$(_core_channel_label "$channel")
+    echo "⚠️ 危险操作检测！"
+    echo "操作类型：更新 ${core} 内核（${channel_label}，版本 v${version}）"
+    echo "影响范围：${core} 二进制与相关服务，更新后需重启服务"
+    echo "风险评估：测试版可能不稳定，更新失败可能导致服务不可用"
+    echo ""
+    read -rp "请确认是否继续？[y/N]: " confirm
+    case "${confirm,,}" in
+        y|yes) return 0 ;;
+        *) _warn "已取消"; return 1 ;;
+    esac
+}
+
+_select_version_from_list() {
+    local repo="$1" channel="$2" name="$3" limit="${4:-10}"
+    local channel_label=$(_core_channel_label "$channel")
+
+    _check_core_update_deps || return 1
+
+    # 获取当前版本
+    local current_ver="未知"
+    case "$name" in
+        Xray) check_cmd xray && current_ver=$(xray version 2>/dev/null | awk 'NR==1{print $2}' | sed 's/^v//') ;;
+        Sing-box) check_cmd sing-box && current_ver=$(sing-box version 2>/dev/null | awk '{print $3}') ;;
+    esac
+
+    local versions
+    versions=$(_get_release_versions "$repo" "$limit" "$channel")
+    if [[ $? -ne 0 ]] || [[ -z "$versions" ]]; then
+        _err "获取 ${name} 版本列表失败"
+        return 1
+    fi
+
+    echo -e "  ${C}可选版本 (${channel_label})${NC}"
+    echo -e "  ${D}当前版本: ${current_ver}${NC}"
+    _line
+    local i=1
+    local -a list=()
+    while read -r v; do
+        [[ -z "$v" ]] && continue
+        local marker=""
+        [[ "$v" == "$current_ver" ]] && marker=" ${Y}[当前]${NC}"
+        echo -e "  ${G}$i${NC}) v$v$marker"
+        list[$i]="$v"
+        ((i++))
+    done <<< "$versions"
+    _line
+    echo -e "  ${D}提示: 输入编号、版本号 (如 1.8.24) 或 0 返回${NC}"
+    read -rp "  请选择: " choice
+    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+        [[ -z "$choice" ]] && _warn "已取消"
+        return 1
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        local selected="${list[$choice]}"
+        if [[ -z "$selected" ]]; then
+            _err "无效选择: 编号超出范围 (1-$((i-1)))"
+            return 1
+        fi
+        echo "$selected"
+    else
+        # 移除可能的 v 前缀
+        echo "${choice#v}"
+    fi
+    return 0
+}
+
+# 备份核心二进制文件
+_backup_core_binary() {
+    local binary_name="$1"
+    local binary_path="/usr/local/bin/$binary_name"
+    [[ ! -f "$binary_path" ]] && return 0
+
+    local backup_dir="/var/backups/vless-cores"
+    mkdir -p "$backup_dir" 2>/dev/null || { _warn "创建备份目录失败"; return 1; }
+
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local current_ver
+    case "$binary_name" in
+        xray) current_ver=$(xray version 2>/dev/null | awk 'NR==1{print $2}' | sed 's/^v//') ;;
+        sing-box) current_ver=$(sing-box version 2>/dev/null | awk '{print $3}') ;;
+    esac
+    [[ -z "$current_ver" ]] && current_ver="unknown"
+
+    local backup_name="${binary_name}_${current_ver}_${timestamp}"
+    if cp "$binary_path" "$backup_dir/$backup_name" 2>/dev/null; then
+        chmod 755 "$backup_dir/$backup_name"
+        _info "已备份: $backup_name"
+        echo "$backup_dir/$backup_name"
+        return 0
+    fi
+    _warn "备份失败"
+    return 1
+}
+
+# 回滚核心二进制文件
+_rollback_core_binary() {
+    local binary_name="$1" backup_file="$2"
+    [[ ! -f "$backup_file" ]] && { _err "备份文件不存在: $backup_file"; return 1; }
+
+    local binary_path="/usr/local/bin/$binary_name"
+    if cp "$backup_file" "$binary_path" 2>/dev/null; then
+        chmod 755 "$binary_path"
+        _ok "已回滚至备份版本"
+        return 0
+    fi
+    _err "回滚失败"
+    return 1
+}
+
+_update_core_to_version() {
+    local core="$1" channel="$2" version="$3" service="$4" install_func="$5"
+    _check_core_update_deps || return 1
+    _confirm_core_update_version "$core" "$channel" "$version" || return 1
+
+    local binary_name
+    case "$core" in
+        Xray) binary_name="xray" ;;
+        Sing-box) binary_name="sing-box" ;;
+        *) _err "未知核心: $core"; return 1 ;;
+    esac
+
+    # 备份当前版本
+    local backup_file
+    if ! backup_file=$(_backup_core_binary "$binary_name"); then
+        # 备份失败但继续更新（可能是首次安装）
+        _warn "备份失败，继续更新（无法回滚）"
+        backup_file=""
+    fi
+
+    local need_restart=false
+    if svc status "$service" 2>/dev/null; then
+        need_restart=true
+        if ! svc stop "$service" 2>/dev/null; then
+            _err "停止服务失败，为避免风险已终止更新"
+            return 1
+        fi
+        _info "服务已停止"
+    fi
+
+    # 执行更新
+    if "$install_func" "$channel" "true" "$version"; then
+        _ok "${core} 内核已更新 (v${version})"
+
+        # 重启服务
+        if [[ "$need_restart" == "true" ]]; then
+            _info "重新启动服务..."
+            if ! svc start "$service" 2>/dev/null; then
+                _err "服务启动失败，请手动检查: svc start $service"
+                return 1
+            fi
+            _ok "服务已启动"
+        fi
+
+        # 展示变更日志
+        case "$core" in
+            Xray) _show_changelog_summary "XTLS/Xray-core" "$version" 8 ;;
+            Sing-box) _show_changelog_summary "SagerNet/sing-box" "$version" 8 ;;
+        esac
+
+        # 清理旧备份 (保留最近 3 个)
+        if [[ -n "$backup_file" ]]; then
+            local backup_dir=$(dirname "$backup_file")
+            ls -t "$backup_dir/${binary_name}_"* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null
+        fi
+        return 0
+    fi
+
+    # 更新失败，尝试回滚
+    _err "${core} 内核更新失败"
+    if [[ -n "$backup_file" ]]; then
+        _warn "尝试回滚到之前版本..."
+        if ! _rollback_core_binary "$binary_name" "$backup_file"; then
+            _err "回滚失败，请手动恢复: cp $backup_file /usr/local/bin/$binary_name"
+        fi
+    fi
+
+    # 尝试恢复服务
+    if [[ "$need_restart" == "true" ]]; then
+        _warn "尝试恢复服务..."
+        if svc start "$service" 2>/dev/null; then
+            _ok "服务已恢复"
+        else
+            _err "服务恢复失败，请手动启动: svc start $service"
+        fi
+    fi
+    return 1
+}
+
+# 后台异步更新核心版本信息（用于版本管理菜单）
+_update_core_versions_async() {
+    local version_info_file="$VERSION_CACHE_DIR/.core_version_info"
+
+    (
+        local xray_latest="" singbox_latest=""
+
+        # 优先从缓存获取稳定版
+        xray_latest=$(_get_cached_version "XTLS/Xray-core" 2>/dev/null)
+        singbox_latest=$(_get_cached_version "SagerNet/sing-box" 2>/dev/null)
+
+        # 写入版本信息
+        {
+            echo "xray_latest=$xray_latest"
+            echo "singbox_latest=$singbox_latest"
+        } > "$version_info_file" 2>/dev/null
+
+        # 标记完成
+        touch "${version_info_file}.done" 2>/dev/null
+
+        # 后台异步更新稳定版缓存
+        _update_version_cache_async "XTLS/Xray-core"
+        _update_version_cache_async "SagerNet/sing-box"
+
+        # 后台异步更新测试版缓存（使用专用函数）
+        # 注意：这些函数内部已经有缓存机制，这里只是触发后台更新
+        (
+            _get_latest_prerelease_version "XTLS/Xray-core" "false" >/dev/null 2>&1
+            _get_latest_prerelease_version "SagerNet/sing-box" "false" >/dev/null 2>&1
+        ) &
+    ) &
+}
+
+_show_core_versions() {
+    # 初始化缓存目录
+    _init_version_cache
+
+    # Xray 版本信息
+    # 输入示例: Xray 25.12.8 (Xray, Penetrates Everything.) 81f8f39 (go1.25.5 linux/amd64)
+    # 输出: 25.12.8
+    local xray_current="未安装"
+    if check_cmd xray; then
+        xray_current=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+        [[ -z "$xray_current" ]] && xray_current="未知"
+    fi
+
+    # Sing-box 版本信息
+    # 输入示例: sing-box version 1.12.14
+    # 输出: 1.12.14
+    local singbox_current="未安装"
+    if check_cmd sing-box; then
+        singbox_current=$(sing-box version 2>/dev/null | awk '{print $3}' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+        [[ -z "$singbox_current" ]] && singbox_current="未知"
+    fi
+
+    # 优先从缓存获取最新版本（立即显示）
+    local xray_latest singbox_latest xray_prerelease singbox_prerelease
+    xray_latest=$(_get_cached_version "XTLS/Xray-core" 2>/dev/null)
+    [[ -z "$xray_latest" ]] && xray_latest="检查中..."
+
+    singbox_latest=$(_get_cached_version "SagerNet/sing-box" 2>/dev/null)
+    [[ -z "$singbox_latest" ]] && singbox_latest="检查中..."
+
+    # 获取测试版版本号（仅从缓存读取，避免同步网络请求阻塞）
+    local xray_prerelease singbox_prerelease
+    local xray_prerelease_cache="$VERSION_CACHE_DIR/XTLS_Xray-core_prerelease"
+    local singbox_prerelease_cache="$VERSION_CACHE_DIR/SagerNet_sing-box_prerelease"
+
+    # 直接从缓存文件读取（不触发网络请求）
+    if [[ -f "$xray_prerelease_cache" ]]; then
+        local cache_time
+        cache_time=$(_get_file_mtime "$xray_prerelease_cache")
+        if [[ -n "$cache_time" ]]; then
+            local current_time=$(date +%s)
+            local age=$((current_time - cache_time))
+            if [[ $age -lt $VERSION_CACHE_TTL ]]; then
+                xray_prerelease=$(cat "$xray_prerelease_cache" 2>/dev/null)
+            fi
+        fi
+    fi
+    [[ -z "$xray_prerelease" ]] && xray_prerelease="检查中..."
+
+    if [[ -f "$singbox_prerelease_cache" ]]; then
+        local cache_time
+        cache_time=$(_get_file_mtime "$singbox_prerelease_cache")
+        if [[ -n "$cache_time" ]]; then
+            local current_time=$(date +%s)
+            local age=$((current_time - cache_time))
+            if [[ $age -lt $VERSION_CACHE_TTL ]]; then
+                singbox_prerelease=$(cat "$singbox_prerelease_cache" 2>/dev/null)
+            fi
+        fi
+    fi
+    [[ -z "$singbox_prerelease" ]] && singbox_prerelease="检查中..."
+
+    # 显示版本信息
+    echo -e "  ${W}Xray${NC}"
+    if [[ "$xray_current" == "未安装" ]]; then
+        echo -e "    当前版本: ${D}${xray_current}${NC}"
+    else
+        local xray_status=""
+        if [[ "$xray_latest" != "检查中..." ]]; then
+            if [[ "$xray_current" == "$xray_latest" ]]; then
+                xray_status=" ${G}[最新]${NC}"
+            else
+                xray_status=" ${Y}[可更新]${NC}"
+            fi
+        fi
+        echo -e "    当前版本: ${G}v${xray_current}${NC}${xray_status}"
+    fi
+
+    if [[ "$xray_latest" != "检查中..." ]]; then
+        echo -e "    稳定版本: ${C}v${xray_latest}${NC}"
+    else
+        echo -e "    稳定版本: ${D}${xray_latest}${NC}"
+    fi
+
+    if [[ "$xray_prerelease" != "检查中..." ]]; then
+        echo -e "    测试版本: ${M}v${xray_prerelease}${NC}"
+    else
+        echo -e "    测试版本: ${D}${xray_prerelease}${NC}"
+    fi
+
+    echo ""
+    echo -e "  ${W}Sing-box${NC}"
+    if [[ "$singbox_current" == "未安装" ]]; then
+        echo -e "    当前版本: ${D}${singbox_current}${NC}"
+    else
+        local singbox_status=""
+        if [[ "$singbox_latest" != "检查中..." ]]; then
+            if [[ "$singbox_current" == "$singbox_latest" ]]; then
+                singbox_status=" ${G}[最新]${NC}"
+            else
+                singbox_status=" ${Y}[可更新]${NC}"
+            fi
+        fi
+        echo -e "    当前版本: ${G}v${singbox_current}${NC}${singbox_status}"
+    fi
+
+    if [[ "$singbox_latest" != "检查中..." ]]; then
+        echo -e "    稳定版本: ${C}v${singbox_latest}${NC}"
+    else
+        echo -e "    稳定版本: ${D}${singbox_latest}${NC}"
+    fi
+
+    if [[ "$singbox_prerelease" != "检查中..." ]]; then
+        echo -e "    测试版本: ${M}v${singbox_prerelease}${NC}"
+    else
+        echo -e "    测试版本: ${D}${singbox_prerelease}${NC}"
+    fi
+
+    # 启动后台异步更新（为下次访问准备）
+    _update_core_versions_async
+}
+
+update_xray_core() {
+    local channel="${1:-stable}"
+    _check_core_update_deps || return 1
+    _confirm_core_update "Xray" "$channel" || return 1
+
+    local is_new_install=false
+    if ! check_cmd xray; then
+        _warn "未检测到 Xray，将执行安装"
+        is_new_install=true
+    fi
+
+    local need_restart=false service_running=false
+    if svc status vless-reality 2>/dev/null; then
+        service_running=true
+        need_restart=true
+        _info "停止 vless-reality 服务..."
+        if ! svc stop vless-reality 2>/dev/null; then
+            _warn "停止服务失败，继续更新"
+        fi
+    fi
+
+    if install_xray "$channel" "true"; then
+        _ok "Xray 内核已更新"
+        if [[ "$need_restart" == "true" ]]; then
+            _info "重新启动 vless-reality 服务..."
+            if svc start vless-reality 2>/dev/null; then
+                _ok "服务已启动"
+            else
+                _err "服务启动失败，请手动检查配置: svc start vless-reality"
+                return 1
+            fi
+        fi
+        return 0
+    fi
+
+    _err "Xray 内核更新失败"
+    if [[ "$service_running" == "true" ]]; then
+        _warn "尝试恢复服务..."
+        if svc start vless-reality 2>/dev/null; then
+            _ok "服务已恢复"
+        else
+            _err "服务恢复失败，请手动检查: svc start vless-reality"
+        fi
+    fi
+    return 1
+}
+
+update_singbox_core() {
+    local channel="${1:-stable}"
+    _check_core_update_deps || return 1
+    _confirm_core_update "Sing-box" "$channel" || return 1
+
+    local is_new_install=false
+    if ! check_cmd sing-box; then
+        _warn "未检测到 Sing-box，将执行安装"
+        is_new_install=true
+    fi
+
+    local need_restart=false service_running=false
+    if svc status vless-singbox 2>/dev/null; then
+        service_running=true
+        need_restart=true
+        _info "停止 vless-singbox 服务..."
+        if ! svc stop vless-singbox 2>/dev/null; then
+            _warn "停止服务失败，继续更新"
+        fi
+    fi
+
+    if install_singbox "$channel" "true"; then
+        _ok "Sing-box 内核已更新"
+        if [[ "$need_restart" == "true" ]]; then
+            _info "重新启动 vless-singbox 服务..."
+            if svc start vless-singbox 2>/dev/null; then
+                _ok "服务已启动"
+            else
+                _err "服务启动失败，请手动检查配置: svc start vless-singbox"
+                return 1
+            fi
+        fi
+        return 0
+    fi
+
+    _err "Sing-box 内核更新失败"
+    if [[ "$service_running" == "true" ]]; then
+        _warn "尝试恢复服务..."
+        if svc start vless-singbox 2>/dev/null; then
+            _ok "服务已恢复"
+        else
+            _err "服务恢复失败，请手动检查: svc start vless-singbox"
+        fi
+    fi
+    return 1
+}
+
+update_xray_core_custom() {
+    local channel=""
+    _header
+    echo -e "  ${W}Xray 指定版本更新${NC}"
+    _line
+    _show_core_versions
+    _line
+
+    _item "1" "稳定版列表"
+    _item "2" "测试版列表"
+    _item "0" "返回"
+    _line
+    read -rp "  请选择: " choice
+    case "$choice" in
+        1) channel="stable" ;;
+        2) channel="prerelease" ;;
+        0) return ;;
+        *) _err "无效选择"; return 1 ;;
+    esac
+
+    if ! check_cmd xray; then
+        _warn "未检测到 Xray，将执行安装"
+    fi
+
+    local version
+    version=$(_select_version_from_list "XTLS/Xray-core" "$channel" "Xray") || return 1
+    _update_core_to_version "Xray" "$channel" "$version" "vless-reality" "install_xray"
+}
+
+update_singbox_core_custom() {
+    local channel=""
+    _header
+    echo -e "  ${W}Sing-box 指定版本更新${NC}"
+    _line
+    _show_core_versions
+    _line
+
+    _item "1" "稳定版列表"
+    _item "2" "测试版列表"
+    _item "0" "返回"
+    _line
+    read -rp "  请选择: " choice
+    case "$choice" in
+        1) channel="stable" ;;
+        2) channel="prerelease" ;;
+        0) return ;;
+        *) _err "无效选择"; return 1 ;;
+    esac
+
+    if ! check_cmd sing-box; then
+        _warn "未检测到 Sing-box，将执行安装"
+    fi
+
+    local version
+    version=$(_select_version_from_list "SagerNet/sing-box" "$channel" "Sing-box") || return 1
+    _update_core_to_version "Sing-box" "$channel" "$version" "vless-singbox" "install_singbox"
+}
+
+update_core_menu() {
+    while true; do
+        _header
+        echo -e "  ${W}核心版本管理 (Xray/Sing-box)${NC}"
+        _line
+        _show_core_versions
+        _line
+        
+        _item "1" "更新 Xray (稳定版)"
+        _item "2" "更新 Xray (测试版)"
+        _item "3" "更新 Sing-box (稳定版)"
+        _item "4" "更新 Sing-box (测试版)"
+        _item "5" "更新全部 (稳定版)"
+        _item "6" "更新全部 (测试版)"
+        _item "7" "指定版本更新 Xray"
+        _item "8" "指定版本更新 Sing-box"
+        _item "0" "返回"
+        _line
+        
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1) update_xray_core "stable" ;;
+            2) update_xray_core "prerelease" ;;
+            3) update_singbox_core "stable" ;;
+            4) update_singbox_core "prerelease" ;;
+            5)
+                echo -e "\n${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                echo -e "  ${W}批量更新进度 (稳定版)${NC}"
+                echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                local xray_result=0 singbox_result=0
+                echo -e "  [1/2] 更新 Xray..."
+                update_xray_core "stable" || xray_result=$?
+                echo -e "\n  [2/2] 更新 Sing-box..."
+                update_singbox_core "stable" || singbox_result=$?
+                echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                if [[ $xray_result -eq 0 ]] && [[ $singbox_result -eq 0 ]]; then
+                    echo -e "  ${G}✓${NC} 批量更新完成"
+                else
+                    echo -e "  ${Y}⚠${NC} 批量更新完成（部分失败）"
+                    [[ $xray_result -ne 0 ]] && echo -e "    ${R}✗${NC} Xray 更新失败"
+                    [[ $singbox_result -ne 0 ]] && echo -e "    ${R}✗${NC} Sing-box 更新失败"
+                fi
+                ;;
+            6)
+                echo -e "\n${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                echo -e "  ${W}批量更新进度 (测试版)${NC}"
+                echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                local xray_result=0 singbox_result=0
+                echo -e "  [1/2] 更新 Xray..."
+                update_xray_core "prerelease" || xray_result=$?
+                echo -e "\n  [2/2] 更新 Sing-box..."
+                update_singbox_core "prerelease" || singbox_result=$?
+                echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                if [[ $xray_result -eq 0 ]] && [[ $singbox_result -eq 0 ]]; then
+                    echo -e "  ${G}✓${NC} 批量更新完成"
+                else
+                    echo -e "  ${Y}⚠${NC} 批量更新完成（部分失败）"
+                    [[ $xray_result -ne 0 ]] && echo -e "    ${R}✗${NC} Xray 更新失败"
+                    [[ $singbox_result -ne 0 ]] && echo -e "    ${R}✗${NC} Sing-box 更新失败"
+                fi
+                ;;
+            7) update_xray_core_custom ;;
+            8) update_singbox_core_custom ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+        _pause
+    done
 }
 
 # 生成 Sing-box 统一配置 (Hy2 + TUIC 共用一个进程)
@@ -11076,20 +12079,20 @@ manage_protocol_services() {
         _item "4" "查看服务状态"
         _item "0" "返回"
         _line
-        
+
         read -rp "  请选择: " choice
         case $choice in
-            1) 
+            1)
                 _info "重启所有服务..."
                 stop_services; sleep 2; start_services && _ok "所有服务已重启"
                 _pause
                 ;;
-            2) 
+            2)
                 _info "停止所有服务..."
                 stop_services; touch "$CFG/paused"; _ok "所有服务已停止"
                 _pause
                 ;;
-            3) 
+            3)
                 _info "启动所有服务..."
                 start_services && _ok "所有服务已启动"
                 _pause
@@ -14995,57 +15998,124 @@ main_menu() {
     check_root
     init_log  # 初始化日志
     init_db   # 初始化 JSON 数据库
-    
+
     # 自动更新系统脚本 (确保 vless 命令始终是最新版本)
     _auto_update_system_script
-    
+
+    # 初始化版本缓存目录
+    _init_version_cache
+
+    # 启动时立即异步获取最新版本（后台执行，不阻塞主界面）
+    # 使用统一函数，一次请求同时获取稳定版和测试版（减少API请求次数）
+    _update_all_versions_async "XTLS/Xray-core"
+    _update_all_versions_async "SagerNet/sing-box"
+
     while true; do
         _header
         echo -e "  ${W}服务端管理${NC}"
-        echo -e "  ${D}系统: $DISTRO | 架构: Xray+Sing-box ${NC}"
+
+        # 获取系统版本信息
+        local os_version="$DISTRO"
+        if [[ -f /etc/os-release ]]; then
+            local version_id=$(grep "^VERSION_ID=" /etc/os-release | cut -d'=' -f2 | tr -d '"')
+            [[ -n "$version_id" ]] && os_version="$DISTRO $version_id"
+        elif [[ -f /etc/lsb-release ]]; then
+            local version_id=$(grep "^DISTRIB_RELEASE=" /etc/lsb-release | cut -d'=' -f2)
+            [[ -n "$version_id" ]] && os_version="$DISTRO $version_id"
+        fi
+
+        # 获取内核版本
+        local kernel_version=$(uname -r)
+
+        # 获取本地核心版本信息（立即显示）
+        local xray_ver="未安装" singbox_ver="未安装"
+        local xray_status="" singbox_status=""
+
+        if check_cmd xray; then
+            # 只提取版本号，过滤掉其他输出
+            xray_ver=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+            [[ -z "$xray_ver" ]] && xray_ver="未知"
+        fi
+
+        if check_cmd sing-box; then
+            # 只提取版本号，过滤掉其他输出
+            singbox_ver=$(sing-box version 2>/dev/null | awk '{print $3}' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+            [[ -z "$singbox_ver" ]] && singbox_ver="未知"
+        fi
+
+        # 启动异步版本检查（后台，仅首次进入时触发）
+        if [[ -z "$_version_check_started" ]]; then
+            _check_version_updates_async "$xray_ver" "$singbox_ver"
+            _version_check_started=1
+        fi
+
+        # 检查是否有版本更新（非阻塞，立即返回）
+        if _has_version_updates; then
+            # 检测到更新，更新状态变量
+            local xray_latest=$(_get_version_update_info "xray")
+            local singbox_latest=$(_get_version_update_info "singbox")
+
+            if [[ -n "$xray_latest" ]]; then
+                xray_status=" ${Y}↑${NC}"
+            fi
+            if [[ -n "$singbox_latest" ]]; then
+                singbox_status=" ${Y}↑${NC}"
+            fi
+        fi
+
+        # 显示版本信息（带或不带更新箭头）
+        echo -e "  ${D}系统: ${os_version} | 内核: ${kernel_version}${NC}"
+        echo -e "  ${D}核心: Xray ${xray_ver}${xray_status} | Sing-box ${singbox_ver}${singbox_status}${NC}"
         echo ""
         show_status
         echo ""
         _line
-        
+
         # 复用 show_status 缓存的结果，避免重复查询数据库
         local installed="$_INSTALLED_CACHE"
         if [[ -n "$installed" ]]; then
             # 多协议服务端菜单
             _item "1" "安装新协议 (多协议共存)"
-            _item "2" "查看所有协议配置"
-            _item "3" "订阅服务管理"
-            _item "4" "管理协议服务"
-            _item "5" "分流管理"
-            _item "6" "配置管理 (导入/导出)"
-            _item "7" "BBR 网络优化"
-            _item "8" "卸载指定协议"
-            _item "9" "完全卸载"
-            _item "l" "查看运行日志"
+            _item "2" "核心版本管理 (Xray/Sing-box)"
+            _item "3" "卸载指定协议"
+            echo -e "  ${D}───────────────────────────────────────────${NC}"
+            _item "4" "查看所有协议配置"
+            _item "5" "配置管理 (导入/导出)"
+            echo -e "  ${D}───────────────────────────────────────────${NC}"
+            _item "6" "订阅服务管理"
+            _item "7" "管理协议服务"
+            _item "8" "分流管理"
+            echo -e "  ${D}───────────────────────────────────────────${NC}"
+            _item "9" "BBR 网络优化"
+            echo -e "  ${D}───────────────────────────────────────────${NC}"
+            _item "10" "查看运行日志"
         else
             _item "1" "安装协议"
             _item "2" "导入配置 (从备份恢复)"
         fi
-        _item "u" "检查更新"
+        echo -e "  ${D}───────────────────────────────────────────${NC}"
+        _item "11" "检查脚本更新"
+        _item "12" "完全卸载"
         _item "0" "退出"
         _line
-        
+
         read -rp "  请选择: " choice || exit 0
         
         local skip_pause=false
         if [[ -n "$installed" ]]; then
             case $choice in
                 1) do_install_server; skip_pause=true ;;
-                2) show_all_protocols_info; skip_pause=true ;;
-                3) manage_subscription; skip_pause=true ;;
-                4) manage_protocol_services; skip_pause=true ;;
-                5) manage_routing; skip_pause=true ;;
-                6) manage_config; skip_pause=true ;;
-                7) enable_bbr; skip_pause=true ;;
-                8) uninstall_specific_protocol; skip_pause=true ;;
-                9) do_uninstall ;;
-                l|L) show_logs; skip_pause=true ;;
-                u|U) do_update ;;
+                2) update_core_menu; skip_pause=true ;;
+                3) uninstall_specific_protocol; skip_pause=true ;;
+                4) show_all_protocols_info; skip_pause=true ;;
+                5) manage_config; skip_pause=true ;;
+                6) manage_subscription; skip_pause=true ;;
+                7) manage_protocol_services; skip_pause=true ;;
+                8) manage_routing; skip_pause=true ;;
+                9) enable_bbr; skip_pause=true ;;
+                10) show_logs; skip_pause=true ;;
+                11) do_update ;;
+                12) do_uninstall ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac
@@ -15053,7 +16123,7 @@ main_menu() {
             case $choice in
                 1) do_install_server; skip_pause=true ;;
                 2) import_config ;;
-                u|U) do_update ;;
+                11) do_update ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac

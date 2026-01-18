@@ -666,12 +666,16 @@ register_protocol() {
         # 覆盖模式：更新指定端口的配置
         echo -e "${CYAN}覆盖端口 $REPLACE_PORT 的配置...${NC}"
         db_update_port "$core" "$protocol" "$REPLACE_PORT" "$config_json"
-    elif [[ "$INSTALL_MODE" == "add" ]] || is_protocol_installed "$protocol"; then
+    elif [[ "$INSTALL_MODE" == "add" ]]; then
         # 添加模式：添加新端口实例
         echo -e "${CYAN}添加新端口 $port 实例...${NC}"
         db_add_port "$core" "$protocol" "$config_json"
+    elif is_protocol_installed "$protocol"; then
+        # 协议已存在但未指定模式：默认添加新端口
+        echo -e "${CYAN}添加新端口 $port 实例...${NC}"
+        db_add_port "$core" "$protocol" "$config_json"
     else
-        # 首次安装：使用原有逻辑
+        # 首次安装：使用单对象格式
         db_add "$core" "$protocol" "$config_json"
     fi
     

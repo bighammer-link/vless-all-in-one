@@ -21,6 +21,8 @@
 
 > <img src="https://akile.io/favicon.ico" height="50"> [AkileCloud](https://akile.io/register?aff_code=b349580b-113a-4b42-ab76-c2db81c5c22d) -  多地区覆盖 / 解锁流媒体 / 提供多国 SOCKS5 落地出口 / 包含原生家宽 IP / 高性价比
 
+> <img src="https://cloud.yt.net/logo.png" height="50"> [YT.NET](https://cloud.yt.net/?ref=13192) -  原生 IP / 送CNIX NAT入口 / 深港节点 / BGP国际网络
+
 ## ✨ 支持协议
 
 | # | 协议 | 特点 | 推荐场景 |
@@ -517,7 +519,7 @@ apk add curl jq unzip iproute2 nginx
 | **VIP Cloud** | 原生IP / 解锁流媒体 / CN2GIA | [购买](https://www.vipcloud.cc/aff/QXUUKZSH) |
 | **Aether Cloud** | 原生IP / IPv6家宽 / 高性价比 | [购买](https://billing.aethercloud.io?ref=Ers87GElwp) |
 | **AkileCloud** | 多地区 / SOCKS5落地 / 家宽IP | [购买](https://akile.io/register?aff_code=b349580b-113a-4b42-ab76-c2db81c5c22d) |
-
+| **YT.NET** | 原生IP / 深港节点 / BGP国际网络 | [购买](https://cloud.yt.net/?ref=13192) |
 ---
 
 ## 🙏 致谢
